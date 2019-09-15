@@ -1,0 +1,200 @@
+<?php
+// $Id$
+/**
+ * @file
+ * An Ubercart payment gateway module for Trexle.
+ */
+
+define('UC_TREXLE_GATEWAY_TEST_URL', 'https://core.trexle.com/api/v1/charges');
+define('UC_TREXLE_GATEWAY_PRODUCTION_URL', 'https://sandbox.trexle.com/api/v1/charges');
+
+/**
+ * Implements hook_payment_gateway().
+ */
+function uc_trexle_gateway_uc_payment_gateway()
+{
+    $gateways['uc_trexle_gateway'] = array(
+        'title' => t('Trexle payments'),
+        'description' => t('Process credit card payments using Trexle'),
+        'settings' => 'uc_trexle_gateway_settings_form',
+        'credit' => 'uc_trexle_gateway_charge',
+    );
+
+    return $gateways;
+}
+
+/**
+ * Callback function for payment gateway settings.
+ */
+function uc_trexle_gateway_settings_form()
+{
+    $form['trexle_gateway_settings'] = array(
+        '#type' => 'fieldset',
+        '#title' => t('Trexle settings'),
+    );
+
+    $form['trexle_gateway_settings']['uc_trexle_gateway_secret'] = array(
+        '#type' => 'textfield',
+        '#title' => t('API Key'),
+        '#default_value' => variable_get('uc_trexle_gateway_secret', ''),
+        '#description' => t("Enter you secret API key"),
+    );
+
+    $form['trexle_gateway_settings']['uc_trexle_gateway_mode'] = array(
+        '#type' => 'radios',
+        '#title' => t('Transaction mode'),
+        '#default_value' => variable_get('uc_trexle_gateway_mode', 'test'),
+        '#description' => t('No charges apply in test mode.'),
+        '#options' => array(
+            'test' => t('Testing'),
+            'production' => t('Production'),
+        ),
+    );
+
+    return $form;
+}
+
+/**
+ * Callback function for the credit payment method.
+ */
+function uc_trexle_gateway_charge($order_id, $amount, $data)
+{
+    global $user;
+
+    if (!function_exists('curl_init')) {
+        drupal_set_message(t('The Trexle Payment service requires curl. Please talk to your system administrator to get this configured.'));
+        return array('success' => FALSE);
+    }
+
+    // This handles the case where a user cancels their order on the checkout screen
+    if (!isset($_SESSION['uc_trexle_order']) || $_SESSION['uc_trexle_order'] != $order_id) {
+        $_SESSION['uc_trexle_order'] = $order_id;
+        unset($_SESSION['uc_trexle_attempt']);
+    }
+
+    // If users attempts to submit order more than once then modify Order ID so
+    // as to avoid a duplicate transaction error.
+    $_SESSION['uc_trexle_attempt'] = empty($_SESSION['uc_trexle_attempt']) ? 1 : ($_SESSION['uc_trexle_attempt'] + 1);
+    $oid = $_SESSION['uc_trexle_attempt'] > 1 ? ($order_id . '-' . $_SESSION['uc_trexle_attempt']) : $order_id;
+    $order = uc_order_load($order_id);
+    $shipping = $tax = $subtotal = 0;
+    $description = '';
+    if (is_array($order->products)) {
+        foreach ($order->products as $product) {
+            if (!empty($description)) {
+                $description .= ' // ';
+            }
+            $description .= $product->title . ' x' . $product->qty;
+            if ($product->data['attributes']) {
+                foreach ($product->data['attributes'] as $key => $value) {
+                    $description .= ', ' . $key . ': ' . $value;
+                }
+            }
+        }
+    }
+
+    $description = drupal_substr($description, 0, 255);
+
+    // convert some data before sending it to Trexle
+    $cardexpyr = $order->payment_details['cc_exp_year'];
+    $cardexpmo = sprintf("%02d", $order->payment_details['cc_exp_month']);
+    $shipping = 0;
+    foreach ($order->line_items as $item) {
+        if ($item['type'] == 'shipping') {
+            $shipping += $item['amount'];
+        }
+    }
+
+    $tax = 0;
+    if (module_exists('uc_taxes')) {
+        foreach (uc_taxes_calculate($order) as $tax_item) {
+            $tax += $tax_item->amount;
+        }
+    }
+
+    if (empty($order->payment_details)) {
+        drupal_set_message(t('There was a problem with this payment. No charge was made.'));
+        return array('success' => FALSE);
+    }
+
+    $billingCountry = uc_get_country_data(array('country_id' => $order->billing_country));
+
+    $trexleData = [
+        'amount' => $amount * 100,
+        'currency' => $order->currency,
+        'description' => 'Order ID: ' . $order->order_id,
+        'email' => $order->primary_email,
+        'ip_address' => $_SERVER['REMOTE_ADDR'],
+        'card[number]' => $order->payment_details['cc_number'],
+        'card[expiry_month]' => $cardexpmo,
+        'card[expiry_year]' => $cardexpyr,
+        'card[cvc]' => $order->payment_details['cc_cvv'],
+        'card[name]' => $order->billing_first_name . ' ' . $order->billing_last_name,
+        'card[address_line1]' => empty($order->billing_street1) ? '-' : $order->billing_street1,
+        'card[address_line2]' => empty($order->billing_street2) ? '-' : $order->billing_street2,
+        'card[address_city]' => empty($order->billing_city) ? '-' : $order->billing_city,
+        'card[address_postcode]' => empty($order->billing_postal_code) ? '000' : $order->billing_postal_code,
+        'card[address_state]' => empty(uc_get_zone_code($order->billing_zone)) ? '-' : uc_get_zone_code($order->billing_zone),
+        'card[address_country]' => empty($billingCountry) ? '-' : $billingCountry[0]['country_iso_code_2']
+    ];
+
+    $apiKey = variable_get('uc_trexle_gateway_secret', '');
+
+    if (variable_get('uc_trexle_gateway_mode', 'test') == 'test') {
+        $apiUrl = UC_TREXLE_GATEWAY_TEST_URL;
+    } else {
+        $apiUrl = UC_TREXLE_GATEWAY_PRODUCTION_URL;
+    }
+
+    $curl = curl_init($apiUrl);
+    curl_setopt($curl, CURLOPT_USERPWD, $apiKey . ':');
+    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, false);
+    curl_setopt($curl, CURLOPT_SSL_VERIFYHOST, false);
+    curl_setopt($curl, CURLOPT_POST, 1);
+    curl_setopt($curl, CURLOPT_POSTFIELDS, $trexleData);
+    curl_setopt($curl, CURLOPT_HTTPHEADER, array('Accept: application/json'));
+    $response = curl_exec($curl);
+    $httpcode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+
+    if ($response) {
+        $response = json_decode($response, true);
+    }
+
+    if ($httpcode == '201') {
+        $message = t('Credit card processed successfully for !amount.',
+            array('!amount' => uc_currency_format($amount)));
+        $result = array(
+            'success' => true,
+            'comment' => $message,
+            'message' => $message,
+            'uid' => $user->uid,
+        );
+        unset($_SESSION['uc_trexle_attempt']);
+    } else {
+
+        if (isset($response['error'])) {
+            $message = t('Transaction declined. !error',
+                array('!error' => $response['detail']));
+            $result = array(
+                'success' => false,
+                'comment' => $message,
+                'message' => $message,
+                'uid' => $user->uid,
+            );
+        } else {
+            $message = t('There was a problem with this payment. No charge was made.',
+                array());
+            $result = array(
+                'success' => false,
+                'comment' => $message,
+                'message' => $message,
+                'uid' => $user->uid,
+            );
+        }
+    }
+
+    uc_order_comment_save($order_id, $user->uid, $message, 'admin');
+    return $result;
+
+}
